@@ -15,12 +15,20 @@ pub fn get_lang() -> Lang {
 }
 
 pub fn detect_system_lang() -> Lang {
-    // Check Windows UI language
     #[cfg(target_os = "windows")]
     {
         let lang = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
-        // Chinese: 0x0804 (zh-CN), 0x0404 (zh-TW), 0x0C04 (zh-HK)
         if (lang & 0xFF) == 0x04 { return Lang::Zh; }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Check LANG / LC_ALL environment variable
+        for var in &["LANG", "LC_ALL", "LC_MESSAGES"] {
+            if let Ok(val) = std::env::var(var) {
+                let lower = val.to_lowercase();
+                if lower.starts_with("zh") { return Lang::Zh; }
+            }
+        }
     }
     Lang::En
 }

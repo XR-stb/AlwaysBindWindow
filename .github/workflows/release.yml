@@ -26,14 +26,14 @@ jobs:
             artifact_name: always-bind-window.exe
             asset_name: AlwaysBindWindow-windows-arm64.exe
 
-          # macOS x64 (Intel)
-          - os: macos-13
+          # macOS x64 (Intel) — cross-compile on arm64 runner
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: always-bind-window
             asset_name: AlwaysBindWindow-macos-x64
 
           # macOS ARM64 (Apple Silicon)
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: always-bind-window
             asset_name: AlwaysBindWindow-macos-arm64
