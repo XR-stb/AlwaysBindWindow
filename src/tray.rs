@@ -97,6 +97,10 @@ fn do_unbind_at_cursor(gm: &Arc<Mutex<GroupManager>>) {
             println!("{}", t("msg.no_group"));
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("Unbind-at-cursor is only supported on Windows for now.");
+    }
 }
 
 fn do_unbind_all(gm: &Arc<Mutex<GroupManager>>) {

@@ -11,12 +11,38 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: always-bind-window.exe
+            artifact_name: always-bind-window.exe
             asset_name: AlwaysBindWindow-windows-x64.exe
+
+          # Windows ARM64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: always-bind-window.exe
+            asset_name: AlwaysBindWindow-windows-arm64.exe
+
+          # macOS x64 (Intel)
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_name: always-bind-window
+            asset_name: AlwaysBindWindow-macos-x64
+
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact_name: always-bind-window
+            asset_name: AlwaysBindWindow-macos-arm64
+
+          # Linux x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: always-bind-window
+            asset_name: AlwaysBindWindow-linux-x64
 
     runs-on: ${{ matrix.os }}
 
@@ -28,14 +54,31 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+          chmod +x ${{ matrix.asset_name }}
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          copy target\${{ matrix.target }}\release\${{ matrix.artifact_name }} ${{ matrix.asset_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          path: ${{ matrix.asset_name }}
 
   release:
     needs: build
@@ -48,10 +91,28 @@ jobs:
         with:
           path: artifacts
 
+      - name: List artifacts
+        run: find artifacts -type f | head -20
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
           generate_release_notes: true
+          body: |
+            ## Downloads
+
+            | Platform | Architecture | File |
+            |----------|-------------|------|
+            | Windows | x64 | `AlwaysBindWindow-windows-x64.exe` |
+            | Windows | ARM64 | `AlwaysBindWindow-windows-arm64.exe` |
+            | macOS | Intel (x64) | `AlwaysBindWindow-macos-x64` |
+            | macOS | Apple Silicon (ARM64) | `AlwaysBindWindow-macos-arm64` |
+            | Linux | x64 | `AlwaysBindWindow-linux-x64` |
+
+            ### Quick Start
+            1. Download the file for your platform
+            2. Run it (on macOS/Linux: `chmod +x` first)
+            3. Press `Ctrl+Alt+G` to lasso-bind windows
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
