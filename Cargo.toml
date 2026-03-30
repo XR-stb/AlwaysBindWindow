@@ -1,6 +1,6 @@
 [package]
 name = "always-bind-window"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Bind multiple windows together - activate any one, all come to front"
 license = "MIT"
@@ -23,6 +23,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
     "Win32_System_Threading",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

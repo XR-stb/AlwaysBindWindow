@@ -1,5 +1,4 @@
-// Uncomment for release:
-// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod group;
 mod platform;
@@ -8,6 +7,7 @@ mod overlay;
 mod picker;
 mod i18n;
 mod settings;
+mod hotkey_dialog;
 
 use log::{info, error};
 use std::sync::{Arc, Mutex};
@@ -26,20 +26,11 @@ fn main() {
         _ => i18n::set_lang(i18n::detect_system_lang()),
     }
 
-    let bind_hk = settings::format_hotkey(&s.hotkey_bind);
-    let unbind_c = settings::format_hotkey(&s.hotkey_unbind_cursor);
-    let unbind_a = settings::format_hotkey(&s.hotkey_unbind_all);
-
-    println!("{}", "=".repeat(45));
-    println!("  {} v{}", i18n::t("app.name"), env!("CARGO_PKG_VERSION"));
-    println!("{}", "-".repeat(45));
-    println!("  {}  ->  {}", bind_hk, i18n::t("hk.bind"));
-    println!("  {}  ->  {}", unbind_c, i18n::t("hk.unbind_cursor"));
-    println!("  {}  ->  {}", unbind_a, i18n::t("hk.unbind_all"));
-    println!("{}", "=".repeat(45));
-    println!();
-
-    info!("AlwaysBindWindow starting...");
+    info!("AlwaysBindWindow v{} starting...", env!("CARGO_PKG_VERSION"));
+    info!("Hotkeys: {} = Bind, {} = Unbind Group, {} = Unbind All",
+        settings::format_hotkey(&s.hotkey_bind),
+        settings::format_hotkey(&s.hotkey_unbind_cursor),
+        settings::format_hotkey(&s.hotkey_unbind_all));
 
     let group_manager = Arc::new(Mutex::new(GroupManager::new()));
 

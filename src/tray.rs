@@ -2,6 +2,7 @@ use crate::group::GroupManager;
 use crate::overlay;
 use crate::i18n::{self, t};
 use crate::settings::{self, Settings};
+use crate::hotkey_dialog;
 use log::{info, error};
 use std::sync::{Arc, Mutex};
 use tray_icon::{
@@ -22,6 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const ID_LASSO: &str = "lasso";
 const ID_UNBIND_CURSOR: &str = "unbind_cursor";
 const ID_UNBIND_ALL: &str = "unbind_all";
+const ID_HOTKEY_SETTINGS: &str = "hotkey_settings";
 const ID_TOGGLE_LANG: &str = "toggle_lang";
 const ID_TOGGLE_AUTOSTART: &str = "toggle_autostart";
 const ID_QUIT: &str = "quit";
@@ -41,6 +43,44 @@ fn create_icon() -> tray_icon::Icon {
         }
     }
     tray_icon::Icon::from_rgba(rgba, size, size).expect("icon")
+}
+
+/// Build the tray menu with current language and settings
+fn build_menu(settings: &Settings) -> Menu {
+    let bind_str = settings::format_hotkey(&settings.hotkey_bind);
+    let unbind_c_str = settings::format_hotkey(&settings.hotkey_unbind_cursor);
+    let unbind_a_str = settings::format_hotkey(&settings.hotkey_unbind_all);
+
+    let menu = Menu::new();
+    let _ = menu.append(&MenuItem::with_id("title", t("app.name"), false, None));
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&MenuItem::with_id(ID_LASSO,
+        &format!("{}  ({})", t("menu.bind"), bind_str), true, None));
+    let _ = menu.append(&MenuItem::with_id(ID_UNBIND_CURSOR,
+        &format!("{}  ({})", t("menu.unbind_cursor"), unbind_c_str), true, None));
+    let _ = menu.append(&MenuItem::with_id(ID_UNBIND_ALL,
+        &format!("{}  ({})", t("menu.unbind_all"), unbind_a_str), true, None));
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&MenuItem::with_id(ID_HOTKEY_SETTINGS, t("menu.hotkey_settings"), true, None));
+    let _ = menu.append(&MenuItem::with_id(ID_TOGGLE_LANG, t("menu.lang"), true, None));
+    let autostart_label = if i18n::get_lang() == i18n::Lang::Zh { "开机自启" } else { "Auto Start" };
+    let autostart_check = CheckMenuItem::with_id(ID_TOGGLE_AUTOSTART,
+        autostart_label, true, settings.auto_start, None);
+    let _ = menu.append(&autostart_check);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&MenuItem::with_id(ID_QUIT, t("menu.quit"), true, None));
+    menu
+}
+
+/// Build tooltip string with current language
+fn build_tooltip(settings: &Settings) -> String {
+    let bind_str = settings::format_hotkey(&settings.hotkey_bind);
+    let unbind_c_str = settings::format_hotkey(&settings.hotkey_unbind_cursor);
+    let unbind_a_str = settings::format_hotkey(&settings.hotkey_unbind_all);
+    format!("{}\n{} = {} | {} = {} | {} = {}",
+        t("app.name"), bind_str, t("hk.bind"),
+        unbind_c_str, t("hk.unbind_cursor"),
+        unbind_a_str, t("hk.unbind_all"))
 }
 
 fn do_lasso_bind(gm: &Arc<Mutex<GroupManager>>) {
@@ -66,8 +106,7 @@ fn do_lasso_bind(gm: &Arc<Mutex<GroupManager>>) {
 
     let mut mgr = gm.lock().unwrap();
     mgr.create_group_from_hwnds(&name, selected);
-    println!("{} {} {}: {}", t("msg.bound"), count, t("msg.windows"), name);
-    info!("Created group '{}' with {} windows", name, count);
+    info!("Bound {} windows: {}", count, name);
 }
 
 fn do_unbind_at_cursor(gm: &Arc<Mutex<GroupManager>>) {
@@ -83,7 +122,6 @@ fn do_unbind_at_cursor(gm: &Arc<Mutex<GroupManager>>) {
             } else { h }
         };
         if hwnd_under_cursor.0.is_null() {
-            println!("{}", t("msg.no_group"));
             return;
         }
         let hv = hwnd_under_cursor.0 as isize;
@@ -92,14 +130,12 @@ fn do_unbind_at_cursor(gm: &Arc<Mutex<GroupManager>>) {
             let group_name = mgr.groups.iter()
                 .find(|g| g.id == group_id).map(|g| g.name.clone()).unwrap_or_default();
             mgr.remove_group(&group_id);
-            println!("{} '{}'", t("msg.unbound_group"), group_name);
-        } else {
-            println!("{}", t("msg.no_group"));
+            info!("Unbound group '{}'", group_name);
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        println!("Unbind-at-cursor is only supported on Windows for now.");
+        info!("Unbind-at-cursor is only supported on Windows for now.");
     }
 }
 
@@ -108,17 +144,20 @@ fn do_unbind_all(gm: &Arc<Mutex<GroupManager>>) {
     let count = mgr.groups.len();
     mgr.groups.clear();
     mgr.active_bindings.clear();
-    println!("{} ({} groups)", t("msg.unbound_all"), count);
+    info!("Unbound all ({} groups)", count);
 }
 
 struct App {
     gm: Arc<Mutex<GroupManager>>,
     settings: Settings,
-    _tray: Option<tray_icon::TrayIcon>,
-    _hk_mgr: Option<GlobalHotKeyManager>,
+    tray: Option<tray_icon::TrayIcon>,
+    hk_mgr: Option<GlobalHotKeyManager>,
     hk_bind_id: Option<u32>,
     hk_unbind_cursor_id: Option<u32>,
     hk_unbind_all_id: Option<u32>,
+    hk_bind: Option<global_hotkey::hotkey::HotKey>,
+    hk_unbind_cursor: Option<global_hotkey::hotkey::HotKey>,
+    hk_unbind_all: Option<global_hotkey::hotkey::HotKey>,
 }
 
 impl ApplicationHandler for App {
@@ -140,6 +179,31 @@ impl ApplicationHandler for App {
                 ID_LASSO => do_lasso_bind(&self.gm),
                 ID_UNBIND_CURSOR => do_unbind_at_cursor(&self.gm),
                 ID_UNBIND_ALL => do_unbind_all(&self.gm),
+                ID_HOTKEY_SETTINGS => {
+                    self.unregister_hotkeys();
+
+                    let result = hotkey_dialog::show_hotkey_dialog(
+                        &self.settings.hotkey_bind,
+                        &self.settings.hotkey_unbind_cursor,
+                        &self.settings.hotkey_unbind_all,
+                    );
+
+                    if let Some(new_hk) = result {
+                        self.settings.hotkey_bind = new_hk.bind;
+                        self.settings.hotkey_unbind_cursor = new_hk.unbind_cursor;
+                        self.settings.hotkey_unbind_all = new_hk.unbind_all;
+                        let _ = settings::save(&self.settings);
+                        info!("Hotkeys updated: bind={}, unbind_cursor={}, unbind_all={}",
+                            settings::format_hotkey(&self.settings.hotkey_bind),
+                            settings::format_hotkey(&self.settings.hotkey_unbind_cursor),
+                            settings::format_hotkey(&self.settings.hotkey_unbind_all));
+                        // Rebuild tray to show updated hotkey strings in menu
+                        self.rebuild_tray();
+                    }
+
+                    self.register_hotkeys();
+                    while GlobalHotKeyEvent::receiver().try_recv().is_ok() {}
+                }
                 ID_TOGGLE_LANG => {
                     let new_lang = if i18n::get_lang() == i18n::Lang::Zh {
                         i18n::Lang::En
@@ -152,7 +216,9 @@ impl ApplicationHandler for App {
                         i18n::Lang::En => "en",
                     }.to_string();
                     let _ = settings::save(&self.settings);
-                    println!("Language: {}", self.settings.lang);
+                    info!("Language: {}", self.settings.lang);
+                    // Rebuild tray menu with new language
+                    self.rebuild_tray();
                 }
                 ID_TOGGLE_AUTOSTART => {
                     self.settings.auto_start = !self.settings.auto_start;
@@ -160,10 +226,92 @@ impl ApplicationHandler for App {
                         error!("Auto-start error: {}", e);
                     }
                     let _ = settings::save(&self.settings);
-                    println!("Auto-start: {}", if self.settings.auto_start { "ON" } else { "OFF" });
+                    info!("Auto-start: {}", if self.settings.auto_start { "ON" } else { "OFF" });
+                    // Rebuild to reflect checkbox state
+                    self.rebuild_tray();
                 }
                 ID_QUIT => std::process::exit(0),
                 _ => {}
+            }
+        }
+    }
+}
+
+impl App {
+    fn unregister_hotkeys(&mut self) {
+        if let Some(mgr) = &self.hk_mgr {
+            if let Some(hk) = &self.hk_bind {
+                let _ = mgr.unregister(*hk);
+            }
+            if let Some(hk) = &self.hk_unbind_cursor {
+                let _ = mgr.unregister(*hk);
+            }
+            if let Some(hk) = &self.hk_unbind_all {
+                let _ = mgr.unregister(*hk);
+            }
+        }
+        self.hk_bind = None;
+        self.hk_unbind_cursor = None;
+        self.hk_unbind_all = None;
+        self.hk_bind_id = None;
+        self.hk_unbind_cursor_id = None;
+        self.hk_unbind_all_id = None;
+    }
+
+    fn register_hotkeys(&mut self) {
+        if let Some(mgr) = &self.hk_mgr {
+            let hk_b = settings::build_hotkey(&self.settings.hotkey_bind);
+            let hk_uc = settings::build_hotkey(&self.settings.hotkey_unbind_cursor);
+            let hk_ua = settings::build_hotkey(&self.settings.hotkey_unbind_all);
+
+            if let Some(hk) = &hk_b {
+                if mgr.register(*hk).is_ok() {
+                    self.hk_bind_id = Some(hk.id());
+                    self.hk_bind = Some(*hk);
+                } else {
+                    error!("Failed to register bind hotkey");
+                }
+            }
+            if let Some(hk) = &hk_uc {
+                if mgr.register(*hk).is_ok() {
+                    self.hk_unbind_cursor_id = Some(hk.id());
+                    self.hk_unbind_cursor = Some(*hk);
+                } else {
+                    error!("Failed to register unbind-cursor hotkey");
+                }
+            }
+            if let Some(hk) = &hk_ua {
+                if mgr.register(*hk).is_ok() {
+                    self.hk_unbind_all_id = Some(hk.id());
+                    self.hk_unbind_all = Some(*hk);
+                } else {
+                    error!("Failed to register unbind-all hotkey");
+                }
+            }
+
+            info!("Hotkeys re-registered");
+        }
+    }
+
+    /// Rebuild the tray icon with updated menu (for language/hotkey/settings changes)
+    fn rebuild_tray(&mut self) {
+        // Drop old tray first
+        self.tray.take();
+
+        let menu = build_menu(&self.settings);
+        let tooltip = build_tooltip(&self.settings);
+
+        match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip(&tooltip)
+            .with_icon(create_icon())
+            .build()
+        {
+            Ok(new_tray) => {
+                self.tray = Some(new_tray);
+            }
+            Err(e) => {
+                error!("Failed to rebuild tray: {}", e);
             }
         }
     }
@@ -173,34 +321,12 @@ pub fn run_tray(gm: Arc<Mutex<GroupManager>>, settings: Settings) -> Result<(), 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let bind_str = settings::format_hotkey(&settings.hotkey_bind);
-    let unbind_c_str = settings::format_hotkey(&settings.hotkey_unbind_cursor);
-    let unbind_a_str = settings::format_hotkey(&settings.hotkey_unbind_all);
-
-    let menu = Menu::new();
-    let _ = menu.append(&MenuItem::with_id("title", t("app.name"), false, None));
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(ID_LASSO,
-        &format!("{}  ({})", t("menu.bind"), bind_str), true, None));
-    let _ = menu.append(&MenuItem::with_id(ID_UNBIND_CURSOR,
-        &format!("{}  ({})", t("menu.unbind_cursor"), unbind_c_str), true, None));
-    let _ = menu.append(&MenuItem::with_id(ID_UNBIND_ALL,
-        &format!("{}  ({})", t("menu.unbind_all"), unbind_a_str), true, None));
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(ID_TOGGLE_LANG, t("menu.lang"), true, None));
-    let autostart_check = CheckMenuItem::with_id(ID_TOGGLE_AUTOSTART,
-        if i18n::get_lang() == i18n::Lang::Zh { "开机自启" } else { "Auto Start" },
-        true, settings.auto_start, None);
-    let _ = menu.append(&autostart_check);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(ID_QUIT, t("menu.quit"), true, None));
+    let menu = build_menu(&settings);
+    let tooltip = build_tooltip(&settings);
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(&format!("{}\n{} = {} | {} = {} | {} = {}",
-            t("app.name"), bind_str, t("hk.bind"),
-            unbind_c_str, t("hk.unbind_cursor"),
-            unbind_a_str, t("hk.unbind_all")))
+        .with_tooltip(&tooltip)
         .with_icon(create_icon())
         .build()?;
 
@@ -218,8 +344,7 @@ pub fn run_tray(gm: Arc<Mutex<GroupManager>>, settings: Settings) -> Result<(), 
     if let Some(hk) = &hk_uc { hk_mgr.register(*hk)?; hk_uc_id = Some(hk.id()); }
     if let Some(hk) = &hk_ua { hk_mgr.register(*hk)?; hk_ua_id = Some(hk.id()); }
 
-    println!("{}", t("app.ready"));
-    info!("Hotkeys registered");
+    info!("Hotkeys registered, tray ready");
 
     // Apply auto-start setting
     if settings.auto_start {
@@ -229,11 +354,14 @@ pub fn run_tray(gm: Arc<Mutex<GroupManager>>, settings: Settings) -> Result<(), 
     let mut app = App {
         gm,
         settings,
-        _tray: Some(tray),
-        _hk_mgr: Some(hk_mgr),
+        tray: Some(tray),
+        hk_mgr: Some(hk_mgr),
         hk_bind_id,
         hk_unbind_cursor_id: hk_uc_id,
         hk_unbind_all_id: hk_ua_id,
+        hk_bind,
+        hk_unbind_cursor: hk_uc,
+        hk_unbind_all: hk_ua,
     };
 
     event_loop.run_app(&mut app)?;
