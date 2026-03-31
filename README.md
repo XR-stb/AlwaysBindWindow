@@ -4,6 +4,8 @@
 
 **将多个窗口绑定在一起 — 同步移动、激活、最小化，如同一体。**
 
+![demo](https://github.com/user-attachments/assets/55724435-7678-4bc8-8edf-07930d6c6820)
+
 [English](#english) | [中文](#中文)
 
 ---
