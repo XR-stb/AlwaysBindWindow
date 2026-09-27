@@ -240,23 +240,27 @@ unsafe extern "system" fn win_event_callback(
     }
 }
 
-/// Move sync: detects drag via GetAsyncKeyState(VK_LBUTTON) + cursor delta.
-/// Uses fixed offsets from fg window position (captured once at drag start).
-/// Repositions siblings as: target = fg_pos_at_start + offset + cursor_delta
+/// Move sync: while VK_LBUTTON is held on a grouped fg window, follows the fg window's
+/// own movement (not the cursor), so dragging inside a window (e.g. panning a chart)
+/// or resizing it does not move its siblings.
+/// Repositions siblings as: target = sibling_pos_at_drag_start + fg_moved
 fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
     let mut tracked_fg: isize = 0;
     // Sibling offsets relative to fg: sibling_pos = fg_pos + offset
     let mut offsets: HashMap<isize, (i32, i32)> = HashMap::new();
     // State for current drag
     let mut drag_active: bool = false;
-    let mut drag_cursor_start: (i32, i32) = (0, 0);
+    // fg window rect at the previous poll of the current drag
+    let mut drag_last_fg: RECT = RECT::default();
+    // Total distance the fg window has moved (without resizing) during the current drag
+    let mut drag_moved: (i32, i32) = (0, 0);
     // Sibling absolute positions at drag start
     let mut drag_sibling_start: HashMap<isize, (i32, i32)> = HashMap::new();
 
     const MAX_DELTA: i32 = 300;
 
-    fn get_cursor() -> (i32, i32) {
-        unsafe { let mut p = POINT::default(); let _ = GetCursorPos(&mut p); (p.x, p.y) }
+    fn get_window_rect(hwnd: HWND) -> Option<RECT> {
+        unsafe { let mut r = RECT::default(); GetWindowRect(hwnd, &mut r).ok().map(|_| r) }
     }
     fn lbutton_down() -> bool {
         unsafe { (GetAsyncKeyState(0x01 /* VK_LBUTTON */) as u16 & 0x8000) != 0 }
@@ -313,13 +317,14 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
             continue;
         }
 
-        let (cx, cy) = get_cursor();
         let lb = lbutton_down();
 
         // Drag just started: left button pressed, have offsets
         if lb && !drag_active && !offsets.is_empty() {
+            let Some(r) = get_window_rect(fg) else { continue; };
             drag_active = true;
-            drag_cursor_start = (cx, cy);
+            drag_last_fg = r;
+            drag_moved = (0, 0);
             // Snapshot sibling positions at drag start
             drag_sibling_start.clear();
             for &sh in &siblings {
@@ -352,12 +357,18 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
             continue;
         }
 
-        // During drag: move siblings by cursor delta from drag start
+        // During drag: move siblings only by how far the fg window itself moved
         if drag_active {
-            let cdx = cx - drag_cursor_start.0;
-            let cdy = cy - drag_cursor_start.1;
-
-            if cdx == 0 && cdy == 0 { continue; }
+            let Some(r) = get_window_rect(fg) else { continue; };
+            let prev = drag_last_fg;
+            drag_last_fg = r;
+            // Only a pure move counts: a drag inside the window leaves it in place,
+            // and a resize from an edge changes its size.
+            let same_size = r.right - r.left == prev.right - prev.left
+                && r.bottom - r.top == prev.bottom - prev.top;
+            if !same_size || (r.left == prev.left && r.top == prev.top) { continue; }
+            drag_moved.0 += r.left - prev.left;
+            drag_moved.1 += r.top - prev.top;
 
             MOVE_IN_PROGRESS.store(true, Ordering::SeqCst);
             unsafe {
@@ -365,8 +376,8 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
                     let swh = HWND(sh as *mut _);
                     if !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() { continue; }
                     if let Some(&(start_x, start_y)) = drag_sibling_start.get(&sh) {
-                        let tx = start_x + cdx;
-                        let ty = start_y + cdy;
+                        let tx = start_x + drag_moved.0;
+                        let ty = start_y + drag_moved.1;
                         let _ = SetWindowPos(swh, HWND(std::ptr::null_mut()),
                             tx, ty, 0, 0,
                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
