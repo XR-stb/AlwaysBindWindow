@@ -1,5 +1,5 @@
 use crate::group::{GroupManager, TrackedWindow};
-use log::{debug, info};
+use log::info;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -193,16 +193,10 @@ unsafe extern "system" fn win_event_callback(
         0x0003 => {
             let now = elapsed_ms();
             if now - LAST_FG_SYNC_MS.load(Ordering::SeqCst) < FG_DEBOUNCE_MS { return; }
-            let mut gm = match gm_arc.try_lock() { Ok(g) => g, Err(_) => return };
-            let mut sibs = gm.get_sibling_hwnds(hv);
-            if sibs.is_empty() && is_real_window(hwnd) {
-                let tw = TrackedWindow { hwnd: hv, process_name: get_process_name(hwnd),
-                    title: get_window_title(hwnd), class_name: get_class_name(hwnd) };
-                if let Some(gid) = gm.try_auto_bind(&tw) {
-                    debug!("Auto-bound to {}", gid);
-                    sibs = gm.get_sibling_hwnds(hv);
-                }
-            }
+            let gm = match gm_arc.try_lock() { Ok(g) => g, Err(_) => return };
+            // Groups hold only the exact windows the user lassoed; no auto-binding by process
+            // name, so other windows of the same app stay independent.
+            let sibs = gm.get_sibling_hwnds(hv);
             if sibs.is_empty() { return; }
             let mut all = sibs; all.push(hv);
             info!("FG sync: {} windows", all.len());
