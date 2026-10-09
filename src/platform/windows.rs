@@ -10,6 +10,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::Graphics::Dwm::*;
+use windows::Win32::Graphics::Gdi::{MonitorFromRect, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
 static GROUP_MANAGER: OnceLock<Arc<Mutex<GroupManager>>> = OnceLock::new();
 static SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -82,6 +84,40 @@ fn get_window_pos(hwnd: HWND) -> Option<(i32, i32)> {
 /// Returns true if coordinates look valid (not minimized at -32000)
 fn is_valid_pos(x: i32, y: i32) -> bool {
     x > -10000 && y > -10000
+}
+
+/// Keep a useful portion of the title bar inside a monitor's work area.
+/// Negative monitor coordinates are valid; use monitor bounds, not screen zero.
+fn reachable_position(hwnd: HWND, x: i32, y: i32, width: i32) -> (i32, i32) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let title_height = 32 * dpi / 96;
+        let title = RECT { left: x, top: y, right: x + width, bottom: y + title_height };
+        let monitor = MonitorFromRect(&title, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() { return (x, y); }
+        crate::window_geometry::reachable_position(x, y, width, 96 * dpi / 96, title_height,
+            (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom))
+    }
+}
+
+pub fn recover_windows(hwnds: &[isize]) -> usize {
+    let mut recovered = 0;
+    unsafe {
+        for &handle in hwnds {
+            let hwnd = HWND(handle as *mut _);
+            if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() { continue; }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() { continue; }
+            let (x, y) = reachable_position(hwnd, rect.left, rect.top, rect.right - rect.left);
+            if (x, y) != (rect.left, rect.top) && SetWindowPos(hwnd, None, x, y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE).is_ok() {
+                recovered += 1;
+            }
+        }
+    }
+    if recovered > 0 { MOVE_CACHE_DIRTY.store(true, Ordering::SeqCst); }
+    recovered
 }
 fn get_zorder_sorted(group_hwnds: &[isize]) -> Vec<isize> {
     unsafe {
@@ -286,7 +322,14 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
                 continue;
             }
         };
-        if !gm_lock.groups.iter().any(|g| g.id == gid && g.sync_move) { continue; }
+        if !gm_lock.movement_enabled(&gid) {
+            // Independent movement invalidates every cached drag position.
+            tracked_fg = 0;
+            offsets.clear();
+            drag_active = false;
+            drag_sibling_start.clear();
+            continue;
+        }
         let siblings = gm_lock.get_sibling_hwnds(fg_h);
         if siblings.is_empty() { continue; }
         drop(gm_lock);
@@ -372,6 +415,8 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
                     if let Some(&(start_x, start_y)) = drag_sibling_start.get(&sh) {
                         let tx = start_x + drag_moved.0;
                         let ty = start_y + drag_moved.1;
+                        let Some(rect) = get_window_rect(swh) else { continue; };
+                        let (tx, ty) = reachable_position(swh, tx, ty, rect.right - rect.left);
                         let _ = SetWindowPos(swh, HWND(std::ptr::null_mut()),
                             tx, ty, 0, 0,
                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);

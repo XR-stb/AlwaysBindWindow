@@ -21,9 +21,15 @@ pub struct Settings {
     pub hotkey_bind: HotkeyConfig,
     pub hotkey_unbind_cursor: HotkeyConfig,
     pub hotkey_unbind_all: HotkeyConfig,
+    #[serde(default = "default_hotkey_sync_move")]
+    pub hotkey_sync_move: HotkeyConfig,
     pub sync_move: bool,
     pub sync_minimize: bool,
     pub auto_start: bool,
+}
+
+fn default_hotkey_sync_move() -> HotkeyConfig {
+    HotkeyConfig::new("Ctrl+Alt", "M")
 }
 
 impl Default for Settings {
@@ -33,6 +39,7 @@ impl Default for Settings {
             hotkey_bind: HotkeyConfig::new("Ctrl+Alt", "G"),
             hotkey_unbind_cursor: HotkeyConfig::new("Ctrl+Alt", "D"),
             hotkey_unbind_all: HotkeyConfig::new("Ctrl+Alt", "U"),
+            hotkey_sync_move: default_hotkey_sync_move(),
             sync_move: true,
             sync_minimize: true,
             auto_start: false,
@@ -112,6 +119,12 @@ pub fn build_hotkey(cfg: &HotkeyConfig) -> Option<global_hotkey::hotkey::HotKey>
     let mods = parse_modifiers(&cfg.modifiers);
     let key = parse_key(&cfg.key)?;
     Some(HotKey::new(Some(mods), key))
+}
+
+/// Reject unsupported keys and duplicate combinations before saving the dialog.
+pub fn valid_hotkeys(configs: &[&HotkeyConfig]) -> bool {
+    let mut ids = std::collections::HashSet::new();
+    configs.iter().all(|cfg| build_hotkey(cfg).map(|hk| ids.insert(hk.id())).unwrap_or(false))
 }
 
 /// Format hotkey for display: "Ctrl+Alt+G"
@@ -217,4 +230,45 @@ pub fn is_auto_start_enabled() -> bool {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     { false }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_gain_movement_hotkey_without_losing_preferences() {
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("hotkey_sync_move");
+        old["lang"] = serde_json::json!("zh");
+        old["sync_move"] = serde_json::json!(false);
+        old["auto_start"] = serde_json::json!(true);
+        old["hotkey_bind"] = serde_json::json!({"modifiers": "Ctrl+Shift", "key": "F8"});
+        let loaded: Settings = serde_json::from_value(old).unwrap();
+        assert_eq!(format_hotkey(&loaded.hotkey_sync_move), "Ctrl+Alt+M");
+        assert_eq!(format_hotkey(&loaded.hotkey_bind), "Ctrl+Shift+F8");
+        assert_eq!(loaded.lang, "zh");
+        assert!(!loaded.sync_move);
+        assert!(loaded.auto_start);
+    }
+
+    #[test]
+    fn duplicate_or_unsupported_hotkeys_are_rejected() {
+        let normal = HotkeyConfig::new("Ctrl+Alt", "G");
+        let duplicate = HotkeyConfig::new("Alt+Ctrl", "g");
+        let movement = default_hotkey_sync_move();
+        let invalid = HotkeyConfig::new("Ctrl", "Unknown");
+        assert!(valid_hotkeys(&[&normal, &movement]));
+        assert!(!valid_hotkeys(&[&normal, &duplicate]));
+        assert!(!valid_hotkeys(&[&normal, &invalid]));
+    }
+
+    #[test]
+    fn custom_movement_hotkey_survives_serialization() {
+        let mut settings = Settings::default();
+        settings.hotkey_sync_move = HotkeyConfig::new("Ctrl+Shift", "F9");
+        let loaded: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(build_hotkey(&loaded.hotkey_sync_move), build_hotkey(&settings.hotkey_sync_move));
+        assert_eq!(format_hotkey(&loaded.hotkey_sync_move), "Ctrl+Shift+F9");
+    }
 }
