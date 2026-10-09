@@ -202,7 +202,7 @@ fn monitor_loop(gm: Arc<Mutex<GroupManager>>) {
             for w in &windows {
                 if w.process_name != fg {
                     if let Some(gid) = gm_lock.find_group_for_hwnd(w.hwnd) {
-                        if gm_lock.groups.iter().any(|g| g.id == gid && g.sync_move) {
+                        if gm_lock.movement_enabled(&gid) {
                             if let Some(pos) = get_window_pos_of_app(&w.process_name) {
                                 drag_siblings.insert(w.process_name.clone(), pos);
                             }

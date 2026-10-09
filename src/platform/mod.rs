@@ -10,6 +10,13 @@ mod linux;
 use crate::group::GroupManager;
 use std::sync::{Arc, Mutex};
 
+pub fn recover_windows(hwnds: &[isize]) -> usize {
+    #[cfg(target_os = "windows")]
+    { windows::recover_windows(hwnds) }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = hwnds; 0 }
+}
+
 pub fn start_monitor(group_manager: Arc<Mutex<GroupManager>>) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     { windows::start_monitor(group_manager) }

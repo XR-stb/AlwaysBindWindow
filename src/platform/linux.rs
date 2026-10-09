@@ -200,7 +200,7 @@ fn monitor_loop(gm: Arc<Mutex<GroupManager>>) {
         let hv = active as isize;
         let gm_lock = match gm.try_lock() { Ok(g) => g, Err(_) => continue };
         let gid = match gm_lock.find_group_for_hwnd(hv) { Some(g) => g.to_string(), None => continue };
-        if !gm_lock.groups.iter().any(|g| g.id == gid && g.sync_move) { continue; }
+        if !gm_lock.movement_enabled(&gid) { continue; }
         let siblings: Vec<isize> = gm_lock.get_sibling_hwnds(hv);
         if siblings.is_empty() { continue; }
         drop(gm_lock);

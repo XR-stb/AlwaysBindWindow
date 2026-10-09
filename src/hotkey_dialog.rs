@@ -8,6 +8,7 @@ pub fn show_hotkey_dialog(
     _bind: &crate::settings::HotkeyConfig,
     _unbind_cursor: &crate::settings::HotkeyConfig,
     _unbind_all: &crate::settings::HotkeyConfig,
+    _sync_move: &crate::settings::HotkeyConfig,
 ) -> Option<HotkeyDialogResult> {
     println!("Hotkey settings dialog is only supported on Windows.");
     None
@@ -18,12 +19,15 @@ pub struct HotkeyDialogResult {
     pub bind: crate::settings::HotkeyConfig,
     pub unbind_cursor: crate::settings::HotkeyConfig,
     pub unbind_all: crate::settings::HotkeyConfig,
+    pub sync_move: crate::settings::HotkeyConfig,
 }
 
 #[cfg(target_os = "windows")]
 mod win_impl {
     use super::HotkeyDialogResult;
     use crate::i18n::t;
+    use crate::native_ui as ui;
+    use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODT_BUTTON};
     use crate::settings::HotkeyConfig;
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicIsize, Ordering};
@@ -35,39 +39,32 @@ mod win_impl {
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    // ── Colors ──────────────────────────────────────────────────
-    const CLR_BG: u32          = 0x00FFFFFF;        // white body background
-    const CLR_HEADER_BG: u32   = 0x00443322;        // dark warm header (BGR: #223344)
-    const CLR_HEADER_TXT: u32  = 0x00FFFFFF;        // white text on header
-    const CLR_LABEL: u32       = 0x00555555;        // dark gray label
-    const CLR_EDIT_BG: u32     = 0x00F5F5F5;        // light gray edit bg
-    const CLR_EDIT_BORDER: u32 = 0x00CCCCCC;        // default edit border
-    const CLR_EDIT_FOCUS: u32  = 0x00D4BC00;        // accent blue-teal border on focus (BGR for #00BCD4)
-    const CLR_EDIT_TEXT: u32   = 0x00333333;        // edit text
-    const CLR_EDIT_REC: u32    = 0x00D4BC00;        // recording text color (teal)
-    const CLR_BTN_PRIMARY: u32 = 0x00D4BC00;        // primary button bg (#00BCD4 in BGR)
-    const CLR_BTN_PRI_HOV: u32 = 0x00E8D040;       // primary hover
-    const CLR_BTN_PRI_TXT: u32 = 0x00FFFFFF;        // white text
-    const CLR_BTN_SEC: u32     = 0x00EEEEEE;        // secondary button bg
-    const CLR_BTN_SEC_HOV: u32 = 0x00DDDDDD;        // secondary hover
-    const CLR_BTN_SEC_TXT: u32 = 0x00444444;        // secondary text
-    const CLR_HINT: u32        = 0x00999999;         // hint text color
-    const CLR_SEPARATOR: u32   = 0x00E0E0E0;        // separator line
+    const CLR_BG: u32 = ui::BG;
+    const CLR_HEADER_BG: u32 = ui::BG;
+    const CLR_HEADER_TXT: u32 = ui::TEXT;
+    const CLR_LABEL: u32 = ui::TEXT;
+    const CLR_EDIT_BG: u32 = ui::SURFACE;
+    const CLR_EDIT_BORDER: u32 = ui::BORDER;
+    const CLR_EDIT_FOCUS: u32 = ui::ACCENT;
+    const CLR_EDIT_TEXT: u32 = ui::TEXT;
+    const CLR_EDIT_REC: u32 = ui::ACCENT;
+    const CLR_HINT: u32 = ui::MUTED;
+    const CLR_SEPARATOR: u32 = ui::BORDER;
 
     // ── Control IDs ─────────────────────────────────────────────
     const IDC_EDIT_BIND: i32 = 1001;
     const IDC_EDIT_UNBIND_CURSOR: i32 = 1002;
     const IDC_EDIT_UNBIND_ALL: i32 = 1003;
+    const IDC_EDIT_SYNC_MOVE: i32 = 1004;
+    const HOTKEY_ROWS: usize = 4;
     const IDC_BTN_SAVE: i32 = 2001;
     const IDC_BTN_CANCEL: i32 = 2002;
     const IDC_BTN_RESET: i32 = 2003;
 
     // Window layout constants (will be DPI-scaled)
-    const WIN_W: i32 = 480;
-    const WIN_H: i32 = 340;
+    const WIN_W: i32 = 520;
+    const WIN_H: i32 = 360 + (ROW_H + ROW_GAP);
 
-    // WM_MOUSELEAVE is not exported by the windows crate
-    const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
     const HEADER_H: i32 = 56;
     const MARGIN: i32 = 24;
     const ROW_H: i32 = 36;
@@ -75,7 +72,7 @@ mod win_impl {
     const LABEL_W: i32 = 130;
     const EDIT_H: i32 = 32;
     const BTN_W: i32 = 100;
-    const BTN_H: i32 = 34;
+    const BTN_H: i32 = 38;
     const CORNER_R: i32 = 6;
 
     thread_local! {
@@ -90,16 +87,18 @@ mod win_impl {
         hwnd_edit_bind: isize,
         hwnd_edit_unbind_cursor: isize,
         hwnd_edit_unbind_all: isize,
+        hwnd_edit_sync_move: isize,
         bind: HotkeyConfig,
         unbind_cursor: HotkeyConfig,
         unbind_all: HotkeyConfig,
+        sync_move: HotkeyConfig,
         saved: bool,
+        done: bool,
         h_font: isize,
         h_font_label: isize,
         h_font_header: isize,
         h_font_hint: isize,
         scale: f32,
-        hover_btn: i32,    // which button is hovered (IDC_BTN_xxx or 0)
     }
 
     // ── helpers ─────────────────────────────────────────────────
@@ -209,19 +208,6 @@ mod win_impl {
         }
     }
 
-    fn draw_text_centered(hdc: HDC, rc: &RECT, text: &str, font: HFONT, color: u32) {
-        unsafe {
-            let old_font = SelectObject(hdc, font);
-            let _ = SetTextColor(hdc, rgb(color));
-            let _ = SetBkMode(hdc, TRANSPARENT);
-            let wide = to_wide(text);
-            let mut r = *rc;
-            let _ = DrawTextW(hdc, &mut wide[..wide.len()-1].to_vec(), &mut r,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            SelectObject(hdc, old_font);
-        }
-    }
-
     fn draw_text_left(hdc: HDC, rc: &RECT, text: &str, font: HFONT, color: u32) {
         unsafe {
             let old_font = SelectObject(hdc, font);
@@ -233,10 +219,6 @@ mod win_impl {
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(hdc, old_font);
         }
-    }
-
-    fn point_in_rect(x: i32, y: i32, rc: &RECT) -> bool {
-        x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
     }
 
     // ── Edit subclass for key capture ───────────────────────────
@@ -271,6 +253,8 @@ mod win_impl {
                             set_edit_text(hwnd, &format_config(&state.unbind_cursor));
                         } else if hv == state.hwnd_edit_unbind_all {
                             set_edit_text(hwnd, &format_config(&state.unbind_all));
+                        } else if hv == state.hwnd_edit_sync_move {
+                            set_edit_text(hwnd, &format_config(&state.sync_move));
                         }
                     });
                 }
@@ -304,6 +288,8 @@ mod win_impl {
                                 set_edit_text(hwnd, &format_config(&state.unbind_cursor));
                             } else if hv == state.hwnd_edit_unbind_all {
                                 set_edit_text(hwnd, &format_config(&state.unbind_all));
+                            } else if hv == state.hwnd_edit_sync_move {
+                                set_edit_text(hwnd, &format_config(&state.sync_move));
                             }
                         });
                         let parent = GetParent(hwnd).unwrap_or(HWND(std::ptr::null_mut()));
@@ -326,6 +312,8 @@ mod win_impl {
                                 state.unbind_cursor = cfg;
                             } else if hv == state.hwnd_edit_unbind_all {
                                 state.unbind_all = cfg;
+                            } else if hv == state.hwnd_edit_sync_move {
+                                state.sync_move = cfg;
                             }
                         });
 
@@ -349,7 +337,7 @@ mod win_impl {
     fn get_btn_rects(scale: f32) -> [(i32, RECT); 3] {
         let s = |v: i32| -> i32 { (v as f32 * scale) as i32 };
         let body_top = s(HEADER_H);
-        let btn_y = body_top + s(MARGIN) + (s(ROW_H) + s(ROW_GAP)) * 3 + s(20);
+        let btn_y = body_top + s(MARGIN) + (s(ROW_H) + s(ROW_GAP)) * HOTKEY_ROWS as i32 + s(20);
         let btn_w = s(BTN_W);
         let btn_h = s(BTN_H);
         let total = btn_w * 3 + s(16) * 2;
@@ -362,14 +350,14 @@ mod win_impl {
         ]
     }
 
-    fn get_edit_rects(scale: f32) -> [(i32, RECT); 3] {
+    fn get_edit_rects(scale: f32) -> [(i32, RECT); HOTKEY_ROWS] {
         let s = |v: i32| -> i32 { (v as f32 * scale) as i32 };
         let body_top = s(HEADER_H);
         let x_edit = s(MARGIN) + s(LABEL_W) + s(12);
         let edit_w = s(WIN_W) - x_edit - s(MARGIN);
         let mut y = body_top + s(MARGIN);
-        let ids = [IDC_EDIT_BIND, IDC_EDIT_UNBIND_CURSOR, IDC_EDIT_UNBIND_ALL];
-        let mut result = [(0, RECT::default()); 3];
+        let ids = [IDC_EDIT_BIND, IDC_EDIT_UNBIND_CURSOR, IDC_EDIT_UNBIND_ALL, IDC_EDIT_SYNC_MOVE];
+        let mut result = [(0, RECT::default()); HOTKEY_ROWS];
         for (i, &id) in ids.iter().enumerate() {
             let edit_y = y + (s(ROW_H) - s(EDIT_H)) / 2;
             result[i] = (id, RECT { left: x_edit, top: edit_y, right: x_edit + edit_w, bottom: edit_y + s(EDIT_H) });
@@ -403,11 +391,12 @@ mod win_impl {
                     let edit_w = s(WIN_W) - x_edit - s(MARGIN);
                     let inset = s(4); // inset so our custom border surrounds the edit
 
-                    let ids = [IDC_EDIT_BIND, IDC_EDIT_UNBIND_CURSOR, IDC_EDIT_UNBIND_ALL];
+                    let ids = [IDC_EDIT_BIND, IDC_EDIT_UNBIND_CURSOR, IDC_EDIT_UNBIND_ALL, IDC_EDIT_SYNC_MOVE];
                     let values = [
                         format_config(&state.bind),
                         format_config(&state.unbind_cursor),
                         format_config(&state.unbind_all),
+                        format_config(&state.sync_move),
                     ];
                     let h_font = HFONT(state.h_font as *mut _);
 
@@ -432,9 +421,26 @@ mod win_impl {
                     let e1 = GetDlgItem(hwnd, IDC_EDIT_BIND);
                     let e2 = GetDlgItem(hwnd, IDC_EDIT_UNBIND_CURSOR);
                     let e3 = GetDlgItem(hwnd, IDC_EDIT_UNBIND_ALL);
+                    let e4 = GetDlgItem(hwnd, IDC_EDIT_SYNC_MOVE);
                     state.hwnd_edit_bind = e1.map(|h| h.0 as isize).unwrap_or(0);
                     state.hwnd_edit_unbind_cursor = e2.map(|h| h.0 as isize).unwrap_or(0);
                     state.hwnd_edit_unbind_all = e3.map(|h| h.0 as isize).unwrap_or(0);
+                    state.hwnd_edit_sync_move = e4.map(|h| h.0 as isize).unwrap_or(0);
+                    for (id, rc) in get_btn_rects(scale) {
+                        let label = match id {
+                            IDC_BTN_SAVE => t("hk_dlg.save"),
+                            IDC_BTN_CANCEL => t("hk_dlg.cancel"),
+                            _ => t("hk_dlg.reset"),
+                        };
+                        if let Ok(button) = CreateWindowExW(WINDOW_EX_STYLE(0), w!("BUTTON"),
+                            PCWSTR(to_wide(label).as_ptr()), WS_CHILD | WS_VISIBLE | WS_TABSTOP
+                                | WINDOW_STYLE(BS_OWNERDRAW as u32), rc.left, rc.top,
+                            rc.right - rc.left, rc.bottom - rc.top, hwnd, HMENU(id as *mut _), None, None) {
+                            SendMessageW(button, WM_SETFONT, WPARAM(h_font.0 as usize), LPARAM(1));
+                            ui::style_button(button);
+                        }
+                    }
+
                 });
                 LRESULT(0)
             }
@@ -448,7 +454,6 @@ mod win_impl {
                     let scale = state.scale;
                     let s = |v: i32| -> i32 { (v as f32 * scale) as i32 };
 
-                    let h_font = HFONT(state.h_font as *mut _);
                     let h_font_label = HFONT(state.h_font_label as *mut _);
                     let h_font_header = HFONT(state.h_font_header as *mut _);
                     let h_font_hint = HFONT(state.h_font_hint as *mut _);
@@ -463,7 +468,7 @@ mod win_impl {
                     // Header title
                     let title_rc = RECT { left: s(MARGIN), top: s(8), right: client.right - s(MARGIN), bottom: s(HEADER_H) - s(8) };
                     // Title icon + text
-                    let title_text = format!("\u{2328}  {}", t("hk_dlg.title")); // ⌨ keyboard icon
+                    let title_text = t("hk_dlg.title");
                     draw_text_left(hdc, &title_rc, &title_text, h_font_header, CLR_HEADER_TXT);
 
                     // ── Body background ──
@@ -476,21 +481,16 @@ mod win_impl {
                         t("hk_dlg.bind_label"),
                         t("hk_dlg.unbind_cursor_label"),
                         t("hk_dlg.unbind_all_label"),
+                        t("hk_dlg.sync_move_label"),
                     ];
 
                     let active_hwnd = ACTIVE_FIELD.load(Ordering::SeqCst);
-                    let edit_hwnds = [state.hwnd_edit_bind, state.hwnd_edit_unbind_cursor, state.hwnd_edit_unbind_all];
+                    let edit_hwnds = [state.hwnd_edit_bind, state.hwnd_edit_unbind_cursor, state.hwnd_edit_unbind_all, state.hwnd_edit_sync_move];
                     let edit_rects = get_edit_rects(scale);
 
                     let mut y = body_top + s(MARGIN);
                     for (i, label) in labels.iter().enumerate() {
-                        // Label with icon
-                        let icon = match i {
-                            0 => "\u{1F517}",  // 🔗 link
-                            1 => "\u{2702}",    // ✂ scissors
-                            _ => "\u{1F5D1}",   // 🗑 wastebasket
-                        };
-                        let label_text = format!("{}  {}", icon, label);
+                        let label_text = label;
                         let label_rc = RECT {
                             left: s(MARGIN), top: y,
                             right: s(MARGIN) + s(LABEL_W), bottom: y + s(ROW_H),
@@ -517,34 +517,13 @@ mod win_impl {
                         right: client.right - s(MARGIN),
                         bottom: y - s(ROW_GAP) + s(20),
                     };
-                    draw_text_left(hdc, &hint_bottom_rc, &format!("\u{1F4A1} {}", t("hk_dlg.hint")), h_font_hint, CLR_HINT);
+                    draw_text_left(hdc, &hint_bottom_rc, t("hk_dlg.hint"), h_font_hint, CLR_HINT);
 
                     // ── Separator line ──
                     let sep_y = y + s(8);
                     let sep_rc = RECT { left: s(MARGIN), top: sep_y, right: client.right - s(MARGIN), bottom: sep_y + 1 };
                     fill_rect_color(hdc, &sep_rc, CLR_SEPARATOR);
 
-                    // ── Buttons ──
-                    let btn_rects = get_btn_rects(scale);
-                    let hover = state.hover_btn;
-
-                    for &(id, ref rc) in &btn_rects {
-                        let (bg, bg_hover, txt_color) = if id == IDC_BTN_SAVE {
-                            (CLR_BTN_PRIMARY, CLR_BTN_PRI_HOV, CLR_BTN_PRI_TXT)
-                        } else {
-                            (CLR_BTN_SEC, CLR_BTN_SEC_HOV, CLR_BTN_SEC_TXT)
-                        };
-                        let bg_actual = if hover == id { bg_hover } else { bg };
-                        fill_rounded_rect(hdc, rc, s(CORNER_R), bg_actual);
-
-                        let label = match id {
-                            IDC_BTN_RESET => t("hk_dlg.reset"),
-                            IDC_BTN_CANCEL => t("hk_dlg.cancel"),
-                            IDC_BTN_SAVE => t("hk_dlg.save"),
-                            _ => "",
-                        };
-                        draw_text_centered(hdc, rc, label, h_font, txt_color);
-                    }
                 });
 
                 let _ = EndPaint(hwnd, &ps);
@@ -562,70 +541,37 @@ mod win_impl {
                 let _ = SetTextColor(hdc, rgb(if is_recording { CLR_EDIT_REC } else { CLR_EDIT_TEXT }));
 
                 // Return a brush matching edit bg
-                let brush = CreateSolidBrush(rgb(CLR_EDIT_BG));
-                return LRESULT(brush.0 as isize);
+                let _ = SetDCBrushColor(hdc, rgb(CLR_EDIT_BG));
+                return LRESULT(GetStockObject(DC_BRUSH).0 as isize);
             }
 
-            WM_MOUSEMOVE => {
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-                let new_hover = DIALOG_STATE.with(|ds| {
-                    let state = ds.borrow();
-                    let btn_rects = get_btn_rects(state.scale);
-                    for &(id, ref rc) in &btn_rects {
-                        if point_in_rect(x, y, rc) {
-                            return id;
-                        }
-                    }
-                    0
-                });
-
-                let old_hover = DIALOG_STATE.with(|ds| ds.borrow().hover_btn);
-                if new_hover != old_hover {
-                    DIALOG_STATE.with(|ds| ds.borrow_mut().hover_btn = new_hover);
-                    let _ = unsafe { InvalidateRect(hwnd, None, false) };
+            WM_DRAWITEM => {
+                let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                if item.CtlType == ODT_BUTTON {
+                    ui::draw_button(item, item.CtlID == IDC_BTN_SAVE as u32);
+                    return LRESULT(1);
                 }
-
-                // Track mouse leave
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                unsafe { let _ = TrackMouseEvent(&mut tme); }
-
                 LRESULT(0)
             }
-
-            WM_MOUSELEAVE_MSG => {
-                DIALOG_STATE.with(|ds| ds.borrow_mut().hover_btn = 0);
-                let _ = unsafe { InvalidateRect(hwnd, None, false) };
-                LRESULT(0)
-            }
-
-            WM_LBUTTONDOWN => {
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-                let clicked = DIALOG_STATE.with(|ds| {
-                    let state = ds.borrow();
-                    let btn_rects = get_btn_rects(state.scale);
-                    for &(id, ref rc) in &btn_rects {
-                        if point_in_rect(x, y, rc) {
-                            return id;
-                        }
-                    }
-                    0
-                });
-
+            WM_COMMAND => {
+                let clicked = (wparam.0 & 0xFFFF) as i32;
+                if (wparam.0 >> 16) != 0 { return LRESULT(0); }
                 match clicked {
-                    IDC_BTN_SAVE => {
+                    IDC_BTN_SAVE | 1 => {
+                        let valid = DIALOG_STATE.with(|ds| {
+                            let state = ds.borrow();
+                            crate::settings::valid_hotkeys(&[&state.bind, &state.unbind_cursor,
+                                &state.unbind_all, &state.sync_move])
+                        });
+                        if !valid {
+                            let _ = MessageBoxW(hwnd, PCWSTR(to_wide(t("hk_dlg.invalid")).as_ptr()),
+                                PCWSTR(to_wide(t("hk_dlg.title")).as_ptr()), MB_OK | MB_ICONWARNING);
+                            return LRESULT(0);
+                        }
                         DIALOG_STATE.with(|ds| ds.borrow_mut().saved = true);
                         let _ = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
                     }
-                    IDC_BTN_CANCEL => {
+                    IDC_BTN_CANCEL | 2 => {
                         let _ = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
                     }
                     IDC_BTN_RESET => {
@@ -635,13 +581,16 @@ mod win_impl {
                             state.bind = defaults.hotkey_bind.clone();
                             state.unbind_cursor = defaults.hotkey_unbind_cursor.clone();
                             state.unbind_all = defaults.hotkey_unbind_all.clone();
+                            state.sync_move = defaults.hotkey_sync_move.clone();
 
                             let e1 = HWND(state.hwnd_edit_bind as *mut _);
                             let e2 = HWND(state.hwnd_edit_unbind_cursor as *mut _);
                             let e3 = HWND(state.hwnd_edit_unbind_all as *mut _);
+                            let e4 = HWND(state.hwnd_edit_sync_move as *mut _);
                             set_edit_text(e1, &format_config(&state.bind));
                             set_edit_text(e2, &format_config(&state.unbind_cursor));
                             set_edit_text(e3, &format_config(&state.unbind_all));
+                            set_edit_text(e4, &format_config(&state.sync_move));
                         });
                         let _ = unsafe { InvalidateRect(hwnd, None, true) };
                     }
@@ -650,22 +599,13 @@ mod win_impl {
                 LRESULT(0)
             }
 
-            WM_SETCURSOR => {
-                // Change cursor to hand over buttons
-                let hover = DIALOG_STATE.with(|ds| ds.borrow().hover_btn);
-                if hover != 0 {
-                    unsafe { let _ = SetCursor(LoadCursorW(None, IDC_HAND).unwrap_or_default()); }
-                    return LRESULT(1);
-                }
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-            }
-
             WM_CLOSE => {
                 unsafe { let _ = DestroyWindow(hwnd); }
                 LRESULT(0)
             }
             WM_DESTROY => {
-                unsafe { PostQuitMessage(0); }
+                // Closing this dialog must not quit the parent tray message loop.
+                DIALOG_STATE.with(|ds| ds.borrow_mut().done = true);
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -676,28 +616,34 @@ mod win_impl {
         bind: &HotkeyConfig,
         unbind_cursor: &HotkeyConfig,
         unbind_all: &HotkeyConfig,
+        sync_move: &HotkeyConfig,
     ) -> Option<HotkeyDialogResult> {
-        // Create fonts
-        let h_font = create_font(-15, 400, "Segoe UI");
-        let h_font_label = create_font(-14, 600, "Segoe UI Semibold");
-        let h_font_header = create_font(-20, 700, "Segoe UI");
-        let h_font_hint = create_font(-12, 400, "Segoe UI");
+        let _dpi_scope = unsafe { ui::DpiScope::new() };
+        let dpi = unsafe { GetDpiForSystem() };
+        let scaled = |size: i32| size * dpi as i32 / 96;
+        // Fonts and client dimensions share the same DPI coordinate space.
+        let h_font = create_font(-scaled(15), 400, "Segoe UI");
+        let h_font_label = create_font(-scaled(14), 600, "Segoe UI Semibold");
+        let h_font_header = create_font(-scaled(20), 700, "Segoe UI");
+        let h_font_hint = create_font(-scaled(12), 400, "Segoe UI");
 
         DIALOG_STATE.with(|ds| {
             let mut state = ds.borrow_mut();
             state.bind = bind.clone();
             state.unbind_cursor = unbind_cursor.clone();
             state.unbind_all = unbind_all.clone();
+            state.sync_move = sync_move.clone();
             state.saved = false;
+            state.done = false;
             state.hwnd_main = 0;
             state.hwnd_edit_bind = 0;
             state.hwnd_edit_unbind_cursor = 0;
             state.hwnd_edit_unbind_all = 0;
+            state.hwnd_edit_sync_move = 0;
             state.h_font = h_font.0 as isize;
             state.h_font_label = h_font_label.0 as isize;
             state.h_font_header = h_font_header.0 as isize;
             state.h_font_hint = h_font_hint.0 as isize;
-            state.hover_btn = 0;
             state.scale = 1.0; // will be updated in WM_CREATE
         });
         ACTIVE_FIELD.store(0, Ordering::SeqCst);
@@ -720,17 +666,16 @@ mod win_impl {
 
             let title = to_wide(t("hk_dlg.title"));
 
-            let scr_w = GetSystemMetrics(SM_CXSCREEN);
-            let scr_h = GetSystemMetrics(SM_CYSCREEN);
-            let x = (scr_w - WIN_W) / 2;
-            let y = (scr_h - WIN_H) / 2;
+            let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+            let ex_style = WS_EX_DLGMODALFRAME;
+            let bounds = ui::centered_rect(WIN_W, WIN_H, dpi, style, ex_style);
 
             let hwnd = CreateWindowExW(
-                WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+                ex_style,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title.as_ptr()),
-                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                x, y, WIN_W, WIN_H,
+                style,
+                bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
                 HWND(std::ptr::null_mut()),
                 HMENU(std::ptr::null_mut()),
                 HINSTANCE(std::ptr::null_mut()),
@@ -746,12 +691,19 @@ mod win_impl {
             let _ = SetForegroundWindow(hwnd);
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            while !DIALOG_STATE.with(|ds| ds.borrow().done) {
+                let status = GetMessageW(&mut msg, None, 0, 0).0;
+                if status <= 0 {
+                    if status == 0 { PostQuitMessage(msg.wParam.0 as i32); }
+                    break;
+                }
                 if !IsDialogMessageW(hwnd, &msg).as_bool() {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
+
+            if IsWindow(hwnd).as_bool() { let _ = DestroyWindow(hwnd); }
 
             let _ = DeleteObject(h_font);
             let _ = DeleteObject(h_font_label);
@@ -765,6 +717,7 @@ mod win_impl {
                         bind: state.bind.clone(),
                         unbind_cursor: state.unbind_cursor.clone(),
                         unbind_all: state.unbind_all.clone(),
+                        sync_move: state.sync_move.clone(),
                     })
                 } else {
                     None
