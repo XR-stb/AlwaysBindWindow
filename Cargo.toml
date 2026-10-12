@@ -1,6 +1,6 @@
 [package]
 name = "always-bind-window"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Bind multiple windows together - activate any one, all come to front"
 license = "MIT"
