@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::{MonitorFromRect, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 
 static GROUP_MANAGER: OnceLock<Arc<Mutex<GroupManager>>> = OnceLock::new();
 static SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -270,55 +270,207 @@ unsafe extern "system" fn win_event_callback(
     }
 }
 
-/// Move sync: while VK_LBUTTON is held on a grouped fg window, follows the fg window's
-/// own movement (not the cursor), so dragging inside a window (e.g. panning a chart)
-/// or resizing it does not move its siblings.
-/// Repositions siblings as: target = sibling_pos_at_drag_start + fg_moved
+/// Which part of the window frame the pointer grabbed when the drag began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragGesture {
+    /// Title-bar or client drag: positional deltas translate the group.
+    Move,
+    /// Edge or corner resize: position changes are layout, not group translation.
+    Resize,
+}
+
+fn get_window_rect(hwnd: HWND) -> Option<RECT> {
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect).ok().map(|_| rect)
+    }
+}
+
+fn lbutton_down() -> bool {
+    unsafe { (GetAsyncKeyState(0x01 /* VK_LBUTTON */) as u16 & 0x8000) != 0 }
+}
+
+fn rect_size(rect: &RECT) -> (i32, i32) {
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+/// Classifies the pointer against the frame metrics of the window. The caption
+/// strip always counts as a move: crossing a monitor with a different DPI resizes
+/// the dragged window mid-drag, and that size change must not stop the follow.
+fn gesture_for_pointer(pointer: POINT, rect: RECT, frame: i32, caption: i32) -> DragGesture {
+    let frame = frame.max(1);
+    let caption = caption.max(1);
+    let on_caption_x = pointer.x >= rect.left + frame && pointer.x < rect.right - frame;
+    let on_caption_y = pointer.y >= rect.top + frame && pointer.y < rect.top + frame + caption;
+    if on_caption_x && on_caption_y {
+        return DragGesture::Move;
+    }
+    let grip = frame + 3;
+    let near_window = pointer.x >= rect.left - 2
+        && pointer.x <= rect.right + 2
+        && pointer.y >= rect.top - 2
+        && pointer.y <= rect.bottom + 2;
+    let on_edge = pointer.x <= rect.left + grip
+        || pointer.x >= rect.right - grip
+        || pointer.y <= rect.top + grip
+        || pointer.y >= rect.bottom - grip;
+    if near_window && on_edge {
+        DragGesture::Resize
+    } else {
+        DragGesture::Move
+    }
+}
+
+fn frame_metrics(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        let caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
+        (frame.max(1), caption.max(1))
+    }
+}
+
+fn drag_gesture_at(hwnd: HWND, rect: RECT) -> DragGesture {
+    let mut pointer = POINT::default();
+    if unsafe { GetCursorPos(&mut pointer) }.is_err() {
+        return DragGesture::Move;
+    }
+    let (frame, caption) = frame_metrics(hwnd);
+    gesture_for_pointer(pointer, rect, frame, caption)
+}
+
+fn capture_sibling_positions(siblings: &[isize]) -> HashMap<isize, (i32, i32)> {
+    let mut positions = HashMap::new();
+    for &sh in siblings {
+        let swh = HWND(sh as *mut _);
+        if unsafe { !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() } {
+            continue;
+        }
+        if let Some((sx, sy)) = get_window_pos(swh) {
+            if is_valid_pos(sx, sy) {
+                positions.insert(sh, (sx, sy));
+            }
+        }
+    }
+    positions
+}
+
+/// Targets are always derived from the drag reference snapshot plus the
+/// foreground window's total displacement. Tests pin this: a missed poll must
+/// never accumulate permanent drift.
+fn translated_targets(
+    start_positions: &HashMap<isize, (i32, i32)>,
+    fg_start: (i32, i32),
+    fg_now: (i32, i32),
+) -> Vec<(isize, i32, i32)> {
+    let dx = fg_now.0 - fg_start.0;
+    let dy = fg_now.1 - fg_start.1;
+    start_positions
+        .iter()
+        .map(|(&hwnd, &(x, y))| (hwnd, x + dx, y + dy))
+        .collect()
+}
+
+fn translate_siblings(
+    start_positions: &HashMap<isize, (i32, i32)>,
+    fg_start: (i32, i32),
+    fg_now: (i32, i32),
+) {
+    // Apply even when the total translation is zero: the foreground window may have
+    // returned to its starting point while a follower is still at a stale target from
+    // the previous poll. Re-applying the drag-reference targets is what makes the
+    // group converge exactly.
+    MOVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+    unsafe {
+        for (sh, target_x, target_y) in translated_targets(start_positions, fg_start, fg_now) {
+            let swh = HWND(sh as *mut _);
+            if !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() {
+                continue;
+            }
+            let Some(rect) = get_window_rect(swh) else {
+                continue;
+            };
+            let (tx, ty) = reachable_position(swh, target_x, target_y, rect.right - rect.left);
+            let _ = SetWindowPos(
+                swh,
+                HWND(std::ptr::null_mut()),
+                tx,
+                ty,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    MOVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+}
+
+/// Move sync: while VK_LBUTTON is held on a grouped fg window, follows the fg
+/// window's own physical translation (not the cursor), so dragging inside a
+/// window (e.g. panning a chart) or a resize does not move its siblings.
+///
+/// Translation is always computed from a reference snapshot to the current
+/// foreground position. Accumulating per-poll deltas (the previous approach) lost
+/// movement whenever a poll was skipped; that happens on every cross-DPI
+/// transition because Windows resizes the dragged window while it crosses.
 fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
     let mut tracked_fg: isize = 0;
     // Sibling offsets relative to fg: sibling_pos = fg_pos + offset
     let mut offsets: HashMap<isize, (i32, i32)> = HashMap::new();
     // State for current drag
     let mut drag_active: bool = false;
+    let mut drag_gesture: DragGesture = DragGesture::Move;
+    // Reference point: fg top-left and sibling positions when the drag started,
+    // or when a non-DPI layout change (restore/maximize) rebased it.
+    let mut drag_start_fg: (i32, i32) = (0, 0);
+    let mut drag_start_dpi: u32 = 0;
     // fg window rect at the previous poll of the current drag
     let mut drag_last_fg: RECT = RECT::default();
-    // Total distance the fg window has moved (without resizing) during the current drag
-    let mut drag_moved: (i32, i32) = (0, 0);
-    // Sibling absolute positions at drag start
+    // Sibling absolute positions at the drag reference point
     let mut drag_sibling_start: HashMap<isize, (i32, i32)> = HashMap::new();
-
-    const MAX_DELTA: i32 = 300;
-
-    fn get_window_rect(hwnd: HWND) -> Option<RECT> {
-        unsafe { let mut r = RECT::default(); GetWindowRect(hwnd, &mut r).ok().map(|_| r) }
-    }
-    fn lbutton_down() -> bool {
-        unsafe { (GetAsyncKeyState(0x01 /* VK_LBUTTON */) as u16 & 0x8000) != 0 }
-    }
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(8));
 
         if MOVE_CACHE_DIRTY.swap(false, Ordering::SeqCst) {
-            tracked_fg = 0; offsets.clear(); drag_active = false; drag_sibling_start.clear();
+            tracked_fg = 0;
+            offsets.clear();
+            drag_active = false;
+            drag_sibling_start.clear();
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
-        if SUPPRESSED.load(Ordering::SeqCst) { continue; }
-
-        let fg = unsafe { GetForegroundWindow() };
-        if fg.0.is_null() { continue; }
-        let fg_h = fg.0 as isize;
-        if unsafe { IsIconic(fg).as_bool() } {
-            if fg_h == tracked_fg { tracked_fg = 0; offsets.clear(); drag_active = false; }
+        if SUPPRESSED.load(Ordering::SeqCst) {
             continue;
         }
 
-        let gm_lock = match gm.try_lock() { Ok(g) => g, Err(_) => continue };
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0.is_null() {
+            continue;
+        }
+        let fg_h = fg.0 as isize;
+        if unsafe { IsIconic(fg).as_bool() } {
+            if fg_h == tracked_fg {
+                tracked_fg = 0;
+                offsets.clear();
+                drag_active = false;
+            }
+            continue;
+        }
+
+        let gm_lock = match gm.try_lock() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
         let gid = match gm_lock.find_group_for_hwnd(fg_h) {
             Some(g) => g.to_string(),
             None => {
-                if tracked_fg != 0 { tracked_fg = 0; offsets.clear(); drag_active = false; }
+                if tracked_fg != 0 {
+                    tracked_fg = 0;
+                    offsets.clear();
+                    drag_active = false;
+                }
                 continue;
             }
         };
@@ -331,7 +483,9 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
             continue;
         }
         let siblings = gm_lock.get_sibling_hwnds(fg_h);
-        if siblings.is_empty() { continue; }
+        if siblings.is_empty() {
+            continue;
+        }
         drop(gm_lock);
 
         // New fg — capture offsets
@@ -344,9 +498,13 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
                 if is_valid_pos(fx, fy) {
                     for &sh in &siblings {
                         let swh = HWND(sh as *mut _);
-                        if unsafe { !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() } { continue; }
+                        if unsafe { !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() } {
+                            continue;
+                        }
                         if let Some((sx, sy)) = get_window_pos(swh) {
-                            if is_valid_pos(sx, sy) { offsets.insert(sh, (sx - fx, sy - fy)); }
+                            if is_valid_pos(sx, sy) {
+                                offsets.insert(sh, (sx - fx, sy - fy));
+                            }
                         }
                     }
                 }
@@ -358,24 +516,35 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
 
         // Drag just started: left button pressed, have offsets
         if lb && !drag_active && !offsets.is_empty() {
-            let Some(r) = get_window_rect(fg) else { continue; };
+            let Some(rect) = get_window_rect(fg) else {
+                continue;
+            };
             drag_active = true;
-            drag_last_fg = r;
-            drag_moved = (0, 0);
-            // Snapshot sibling positions at drag start
-            drag_sibling_start.clear();
-            for &sh in &siblings {
-                let swh = HWND(sh as *mut _);
-                if unsafe { !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() } { continue; }
-                if let Some((sx, sy)) = get_window_pos(swh) {
-                    if is_valid_pos(sx, sy) { drag_sibling_start.insert(sh, (sx, sy)); }
-                }
-            }
+            drag_gesture = drag_gesture_at(fg, rect);
+            drag_start_fg = (rect.left, rect.top);
+            drag_start_dpi = unsafe { GetDpiForWindow(fg) };
+            drag_last_fg = rect;
+            drag_sibling_start = capture_sibling_positions(&siblings);
             continue;
         }
 
-        // Drag ended: left button released
+        // Drag ended: left button released. Flush the final translation first so a
+        // flick released while still moving does not leave the group stretched.
         if !lb && drag_active {
+            if drag_gesture == DragGesture::Move {
+                if let Some(rect) = get_window_rect(fg) {
+                    let dpi = unsafe { GetDpiForWindow(fg) };
+                    let layout_jump =
+                        rect_size(&rect) != rect_size(&drag_last_fg) && dpi == drag_start_dpi;
+                    if !layout_jump {
+                        translate_siblings(
+                            &drag_sibling_start,
+                            drag_start_fg,
+                            (rect.left, rect.top),
+                        );
+                    }
+                }
+            }
             drag_active = false;
             drag_sibling_start.clear();
             // Re-capture offsets at new positions
@@ -384,9 +553,13 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
                     offsets.clear();
                     for &sh in &siblings {
                         let swh = HWND(sh as *mut _);
-                        if unsafe { !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() } { continue; }
+                        if unsafe { !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() } {
+                            continue;
+                        }
                         if let Some((sx, sy)) = get_window_pos(swh) {
-                            if is_valid_pos(sx, sy) { offsets.insert(sh, (sx - fx, sy - fy)); }
+                            if is_valid_pos(sx, sy) {
+                                offsets.insert(sh, (sx - fx, sy - fy));
+                            }
                         }
                     }
                 }
@@ -394,36 +567,38 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
             continue;
         }
 
-        // During drag: move siblings only by how far the fg window itself moved
+        // During drag: translate siblings by how far the fg window itself moved
         if drag_active {
-            let Some(r) = get_window_rect(fg) else { continue; };
-            let prev = drag_last_fg;
-            drag_last_fg = r;
-            // Only a pure move counts: a drag inside the window leaves it in place,
-            // and a resize from an edge changes its size.
-            let same_size = r.right - r.left == prev.right - prev.left
-                && r.bottom - r.top == prev.bottom - prev.top;
-            if !same_size || (r.left == prev.left && r.top == prev.top) { continue; }
-            drag_moved.0 += r.left - prev.left;
-            drag_moved.1 += r.top - prev.top;
-
-            MOVE_IN_PROGRESS.store(true, Ordering::SeqCst);
-            unsafe {
-                for &sh in &siblings {
-                    let swh = HWND(sh as *mut _);
-                    if !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() { continue; }
-                    if let Some(&(start_x, start_y)) = drag_sibling_start.get(&sh) {
-                        let tx = start_x + drag_moved.0;
-                        let ty = start_y + drag_moved.1;
-                        let Some(rect) = get_window_rect(swh) else { continue; };
-                        let (tx, ty) = reachable_position(swh, tx, ty, rect.right - rect.left);
-                        let _ = SetWindowPos(swh, HWND(std::ptr::null_mut()),
-                            tx, ty, 0, 0,
-                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                    }
-                }
+            let Some(rect) = get_window_rect(fg) else {
+                continue;
+            };
+            let previous = drag_last_fg;
+            drag_last_fg = rect;
+            if rect.left == previous.left && rect.top == previous.top {
+                continue;
             }
-            MOVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            if drag_gesture == DragGesture::Resize {
+                continue;
+            }
+            let dpi = unsafe { GetDpiForWindow(fg) };
+            let dpi_changed = dpi != drag_start_dpi;
+            if dpi_changed {
+                drag_start_dpi = dpi;
+            }
+            let size_changed = rect_size(&rect) != rect_size(&previous);
+            if size_changed && !dpi_changed {
+                // A size change without a DPI change is a restore/maximize/layout
+                // jump, not pointer translation: keep the group where it is and
+                // rebase the reference point for the rest of the drag.
+                drag_start_fg = (rect.left, rect.top);
+                drag_sibling_start = capture_sibling_positions(&siblings);
+                continue;
+            }
+            translate_siblings(
+                &drag_sibling_start,
+                drag_start_fg,
+                (rect.left, rect.top),
+            );
         }
     }
 }
@@ -456,4 +631,82 @@ pub fn start_monitor(gm: Arc<Mutex<GroupManager>>) -> Result<(), Box<dyn std::er
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod drag_sync_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    fn point(x: i32, y: i32) -> POINT {
+        POINT { x, y }
+    }
+
+    #[test]
+    fn caption_strip_is_a_move_even_next_to_the_top_resize_border() {
+        let window = rect(100, 100, 900, 600);
+        // Three pixels below the frame is still caption: a DPI-change resize in
+        // the middle of a title-bar drag must not be classified as an edge resize.
+        assert_eq!(
+            gesture_for_pointer(point(500, 111), window, 8, 23),
+            DragGesture::Move
+        );
+    }
+
+    #[test]
+    fn edges_and_corners_are_resizes() {
+        let window = rect(100, 100, 900, 600);
+        for edge in [
+            point(101, 300),
+            point(899, 300),
+            point(500, 101),
+            point(500, 599),
+            point(101, 101),
+            point(899, 599),
+        ] {
+            assert_eq!(
+                gesture_for_pointer(edge, window, 8, 23),
+                DragGesture::Resize
+            );
+        }
+    }
+
+    #[test]
+    fn client_area_drag_counts_as_a_move() {
+        let window = rect(100, 100, 900, 600);
+        assert_eq!(
+            gesture_for_pointer(point(500, 300), window, 8, 23),
+            DragGesture::Move
+        );
+    }
+
+    #[test]
+    fn translation_targets_come_from_the_drag_reference_and_current_position() {
+        let mut starts = HashMap::new();
+        starts.insert(2_isize, (500, 300));
+        starts.insert(3_isize, (900, 300));
+        let reference = (100, 100);
+
+        let mut after_first_tick = translated_targets(&starts, reference, (160, 100));
+        after_first_tick.sort();
+        assert_eq!(after_first_tick, vec![(2, 560, 300), (3, 960, 300)]);
+
+        // Even if an intermediate poll is missed, the next tick derives targets
+        // from the reference snapshot, so no movement is lost.
+        let mut after_skipped_tick = translated_targets(&starts, reference, (220, 120));
+        after_skipped_tick.sort();
+        assert_eq!(after_skipped_tick, vec![(2, 620, 320), (3, 1020, 320)]);
+    }
+
+    #[test]
+    fn returning_to_the_drag_reference_restores_the_original_targets() {
+        let mut starts = HashMap::new();
+        starts.insert(2_isize, (500, 300));
+        let back = translated_targets(&starts, (100, 100), (100, 100));
+        assert_eq!(back, vec![(2, 500, 300)]);
+    }
 }
