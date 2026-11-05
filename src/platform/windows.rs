@@ -10,8 +10,13 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::Graphics::Dwm::*;
-use windows::Win32::Graphics::Gdi::{MonitorFromRect, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows::Win32::Graphics::Gdi::{MonitorFromRect, MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetDpiForMonitor, GetDpiForWindow,
+    GetSystemMetricsForDpi, GetWindowDpiAwarenessContext, SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
+    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, MDT_EFFECTIVE_DPI,
+};
 
 static GROUP_MANAGER: OnceLock<Arc<Mutex<GroupManager>>> = OnceLock::new();
 static SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -340,6 +345,63 @@ fn drag_gesture_at(hwnd: HWND, rect: RECT) -> DragGesture {
     gesture_for_pointer(pointer, rect, frame, caption)
 }
 
+/// DPI of the monitor under the window, independent of the window's own DPI
+/// awareness. System-aware windows keep reporting their system DPI from
+/// GetDpiForWindow, but the monitor DPI still changes when they cross monitors.
+fn monitor_dpi(hwnd: HWND) -> u32 {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_x > 0 {
+            return dpi_x;
+        }
+        GetDpiForWindow(hwnd).max(96)
+    }
+}
+
+/// A size change that matches a common monitor DPI ratio is a DPI rescale, not a
+/// resize/restore jump. Windows rescales system-aware and unaware windows itself
+/// while they cross a monitor with a different DPI.
+fn looks_like_dpi_scale(old: (i32, i32), new: (i32, i32)) -> bool {
+    if old.0 <= 0 || old.1 <= 0 || new.0 <= 0 || new.1 <= 0 {
+        return false;
+    }
+    let rx = new.0 as f32 / old.0 as f32;
+    let ry = new.1 as f32 / old.1 as f32;
+    if (rx - ry).abs() > 0.04 {
+        return false;
+    }
+    const RATIOS: [f32; 14] = [
+        1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 0.8, 0.6667, 0.5714, 0.5, 0.4444, 0.4, 0.3333,
+    ];
+    RATIOS.iter().any(|ratio| (rx - ratio).abs() <= 0.045)
+}
+
+/// System-aware and unaware windows are DPI-virtualized by Windows: their
+/// coordinates are reported in a virtual space that changes when they cross a
+/// monitor with a different DPI. Switch the sync thread to the window's own
+/// awareness for the duration of a drag so GetWindowRect and SetWindowPos stay
+/// in one consistent coordinate space for the whole group.
+fn virtualized_awareness(hwnd: HWND) -> Option<DPI_AWARENESS_CONTEXT> {
+    unsafe {
+        let context = GetWindowDpiAwarenessContext(hwnd);
+        match GetAwarenessFromDpiAwarenessContext(context) {
+            DPI_AWARENESS_PER_MONITOR_AWARE => None,
+            DPI_AWARENESS_SYSTEM_AWARE => Some(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE),
+            _ => Some(DPI_AWARENESS_CONTEXT_UNAWARE),
+        }
+    }
+}
+
+fn restore_thread_awareness(context: &mut Option<DPI_AWARENESS_CONTEXT>) {
+    if let Some(previous) = context.take() {
+        unsafe {
+            SetThreadDpiAwarenessContext(previous);
+        }
+    }
+}
+
 fn capture_sibling_positions(siblings: &[isize]) -> HashMap<isize, (i32, i32)> {
     let mut positions = HashMap::new();
     for &sh in siblings {
@@ -388,10 +450,10 @@ fn translate_siblings(
             if !IsWindow(swh).as_bool() || IsIconic(swh).as_bool() {
                 continue;
             }
-            let Some(rect) = get_window_rect(swh) else {
-                continue;
-            };
-            let (tx, ty) = reachable_position(swh, target_x, target_y, rect.right - rect.left);
+            // Synchronized movement is rigid: preserve the group's relative layout
+            // even when a follower would end up partly off-screen. The existing
+            // "recover off-screen windows" command remains available.
+            let (tx, ty) = (target_x, target_y);
             let _ = SetWindowPos(
                 swh,
                 HWND(std::ptr::null_mut()),
@@ -424,7 +486,8 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
     // Reference point: fg top-left and sibling positions when the drag started,
     // or when a non-DPI layout change (restore/maximize) rebased it.
     let mut drag_start_fg: (i32, i32) = (0, 0);
-    let mut drag_start_dpi: u32 = 0;
+    let mut drag_last_dpi: u32 = 0;
+    let mut drag_thread_awareness: Option<DPI_AWARENESS_CONTEXT> = None;
     // fg window rect at the previous poll of the current drag
     let mut drag_last_fg: RECT = RECT::default();
     // Sibling absolute positions at the drag reference point
@@ -432,6 +495,9 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(8));
+        if !drag_active {
+            restore_thread_awareness(&mut drag_thread_awareness);
+        }
 
         if MOVE_CACHE_DIRTY.swap(false, Ordering::SeqCst) {
             tracked_fg = 0;
@@ -516,13 +582,16 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
 
         // Drag just started: left button pressed, have offsets
         if lb && !drag_active && !offsets.is_empty() {
+            drag_thread_awareness = virtualized_awareness(fg)
+                .map(|context| unsafe { SetThreadDpiAwarenessContext(context) });
             let Some(rect) = get_window_rect(fg) else {
+                restore_thread_awareness(&mut drag_thread_awareness);
                 continue;
             };
             drag_active = true;
             drag_gesture = drag_gesture_at(fg, rect);
             drag_start_fg = (rect.left, rect.top);
-            drag_start_dpi = unsafe { GetDpiForWindow(fg) };
+            drag_last_dpi = monitor_dpi(fg);
             drag_last_fg = rect;
             drag_sibling_start = capture_sibling_positions(&siblings);
             continue;
@@ -533,9 +602,15 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
         if !lb && drag_active {
             if drag_gesture == DragGesture::Move {
                 if let Some(rect) = get_window_rect(fg) {
-                    let dpi = unsafe { GetDpiForWindow(fg) };
-                    let layout_jump =
-                        rect_size(&rect) != rect_size(&drag_last_fg) && dpi == drag_start_dpi;
+                    let dpi = monitor_dpi(fg);
+                    let size_changed = rect_size(&rect) != rect_size(&drag_last_fg);
+                    let dpi_resize = size_changed
+                        && (dpi != drag_last_dpi
+                            || looks_like_dpi_scale(
+                                rect_size(&drag_last_fg),
+                                rect_size(&rect),
+                            ));
+                    let layout_jump = size_changed && !dpi_resize;
                     if !layout_jump {
                         translate_siblings(
                             &drag_sibling_start,
@@ -580,13 +655,13 @@ fn move_sync_loop(gm: Arc<Mutex<GroupManager>>) {
             if drag_gesture == DragGesture::Resize {
                 continue;
             }
-            let dpi = unsafe { GetDpiForWindow(fg) };
-            let dpi_changed = dpi != drag_start_dpi;
-            if dpi_changed {
-                drag_start_dpi = dpi;
-            }
+            let dpi = monitor_dpi(fg);
+            let dpi_changed = dpi != drag_last_dpi;
+            drag_last_dpi = dpi;
             let size_changed = rect_size(&rect) != rect_size(&previous);
-            if size_changed && !dpi_changed {
+            let dpi_resize = size_changed
+                && (dpi_changed || looks_like_dpi_scale(rect_size(&previous), rect_size(&rect)));
+            if size_changed && !dpi_resize {
                 // A size change without a DPI change is a restore/maximize/layout
                 // jump, not pointer translation: keep the group where it is and
                 // rebase the reference point for the rest of the drag.
@@ -700,6 +775,16 @@ mod drag_sync_tests {
         let mut after_skipped_tick = translated_targets(&starts, reference, (220, 120));
         after_skipped_tick.sort();
         assert_eq!(after_skipped_tick, vec![(2, 620, 320), (3, 1020, 320)]);
+    }
+
+    #[test]
+    fn dpi_rescale_ratios_are_recognised() {
+        // 100% -> 125% virtualized window and back.
+        assert!(looks_like_dpi_scale((720, 644), (576, 515)));
+        assert!(looks_like_dpi_scale((576, 515), (720, 644)));
+        // A restore/maximize jump is not a DPI ratio.
+        assert!(!looks_like_dpi_scale((1920, 1080), (720, 644)));
+        assert!(!looks_like_dpi_scale((720, 644), (1000, 500)));
     }
 
     #[test]
